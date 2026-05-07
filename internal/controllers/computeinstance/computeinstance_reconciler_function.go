@@ -422,6 +422,33 @@ func (t *task) getSubnetCR(ctx context.Context, subnetID string) (*osacv1alpha1.
 	return &items[0], nil
 }
 
+// getSecurityGroupCR looks up a SecurityGroup CR in the hub cluster by its fulfillment UUID label.
+func (t *task) getSecurityGroupCR(ctx context.Context, securityGroupID string) (*osacv1alpha1.SecurityGroup, error) {
+	list := &osacv1alpha1.SecurityGroupList{}
+	err := t.hubClient.List(
+		ctx, list,
+		clnt.InNamespace(t.hubNamespace),
+		clnt.MatchingLabels{
+			labels.SecurityGroupUuid: securityGroupID,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	items := list.Items
+	count := len(items)
+	if count > 1 {
+		return nil, fmt.Errorf(
+			"expected at most one security group with identifier '%s' but found %d",
+			securityGroupID, count,
+		)
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	return &items[0], nil
+}
+
 // addFinalizer adds the controller finalizer if it is not already present. Returns true if the finalizer was added,
 // false if it was already present.
 func (t *task) addFinalizer() bool {
@@ -499,9 +526,11 @@ func (t *task) buildSpec(ctx context.Context) (osacv1alpha1.ComputeInstanceSpec,
 	// Add explicit spec fields if present:
 	t.addExplicitFields(&spec)
 
-	// Add subnet reference if subnet is specified
-	if t.computeInstance.GetSpec().HasSubnet() {
-		subnetID := t.computeInstance.GetSpec().GetSubnet()
+	ciSpec := t.computeInstance.GetSpec()
+
+	// Add subnet reference if subnet is specified (legacy path - without network_attachments)
+	if len(ciSpec.GetNetworkAttachments()) == 0 && ciSpec.HasSubnet() {
+		subnetID := ciSpec.GetSubnet()
 		subnetCR, err := t.getSubnetCR(ctx, subnetID)
 		if err != nil {
 			t.r.logger.WarnContext(
@@ -525,6 +554,86 @@ func (t *task) buildSpec(ctx context.Context) (osacv1alpha1.ComputeInstanceSpec,
 				"Subnet CR not found",
 				slog.String("subnet_id", subnetID),
 			)
+		}
+		return spec, nil
+	}
+
+	// Handle new network_attachments field
+	if len(ciSpec.GetNetworkAttachments()) > 0 {
+		networkAttachments := make([]osacv1alpha1.NetworkAttachment, 0, len(ciSpec.GetNetworkAttachments()))
+		for _, att := range ciSpec.GetNetworkAttachments() {
+			subnetID := att.GetSubnet()
+			if subnetID == "" {
+				continue
+			}
+
+			var subnetRef string
+			subnetCR, err := t.getSubnetCR(ctx, subnetID)
+			if err != nil {
+				t.r.logger.WarnContext(
+					ctx,
+					"Failed to look up Subnet CR",
+					slog.String("subnet_id", subnetID),
+					slog.String("error", err.Error()),
+				)
+				continue
+			} else if subnetCR != nil {
+				subnetRef = subnetCR.GetName()
+				t.r.logger.DebugContext(
+					ctx,
+					"Resolved subnetRef from Subnet CR",
+					slog.String("subnet_id", subnetID),
+					slog.String("subnet_ref", subnetRef),
+				)
+			} else {
+				t.r.logger.WarnContext(
+					ctx,
+					"Subnet CR not found",
+					slog.String("subnet_id", subnetID),
+				)
+				continue
+			}
+
+			sgRefs := make([]string, 0, len(att.GetSecurityGroups()))
+			for _, sgID := range att.GetSecurityGroups() {
+				if sgID == "" {
+					continue
+				}
+				sgCR, sgErr := t.getSecurityGroupCR(ctx, sgID)
+				if sgErr != nil {
+					t.r.logger.WarnContext(
+						ctx,
+						"Failed to look up SecurityGroup CR",
+						slog.String("security_group_id", sgID),
+						slog.String("error", sgErr.Error()),
+					)
+					continue
+				}
+				if sgCR != nil {
+					sgRefs = append(sgRefs, sgCR.GetName())
+					t.r.logger.DebugContext(
+						ctx,
+						"Resolved securityGroupRef from SecurityGroup CR",
+						slog.String("security_group_id", sgID),
+						slog.String("security_group_ref", sgCR.GetName()),
+					)
+				} else {
+					t.r.logger.WarnContext(
+						ctx,
+						"SecurityGroup CR not found",
+						slog.String("security_group_id", sgID),
+					)
+				}
+			}
+
+			networkAttachments = append(networkAttachments, osacv1alpha1.NetworkAttachment{
+				SubnetRef:         subnetRef,
+				SecurityGroupRefs: sgRefs,
+			})
+		}
+
+		if len(networkAttachments) > 0 {
+			spec.NetworkAttachments = networkAttachments
 		}
 	}
 

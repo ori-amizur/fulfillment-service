@@ -1165,6 +1165,57 @@ var _ = Describe("Private compute instances server", func() {
 			})
 		})
 
+		Context("network_attachments", func() {
+			It("Should reject mixing legacy subnet with network_attachments", func() {
+				subnet := createTestSubnet(ctx, virtualNetwork.GetId(), privatev1.SubnetState_SUBNET_STATE_READY)
+				vm := privatev1.ComputeInstance_builder{
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						Template: template.GetId(),
+						Subnet:   proto.String(subnet.GetId()),
+						NetworkAttachments: []*privatev1.NetworkAttachment{
+							privatev1.NetworkAttachment_builder{Subnet: subnet.GetId()}.Build(),
+						},
+					}.Build(),
+				}.Build()
+
+				request := &privatev1.ComputeInstancesCreateRequest{}
+				request.SetObject(vm)
+
+				response, err := server.Create(ctx, request)
+				Expect(err).To(HaveOccurred())
+				Expect(response).To(BeNil())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+				Expect(status.Message()).To(ContainSubstring("do not combine"))
+			})
+
+			It("Should succeed with two READY subnets as separate attachments", func() {
+				s1 := createTestSubnet(ctx, virtualNetwork.GetId(), privatev1.SubnetState_SUBNET_STATE_READY)
+				s2 := createTestSubnet(ctx, virtualNetwork.GetId(), privatev1.SubnetState_SUBNET_STATE_READY)
+
+				vm := privatev1.ComputeInstance_builder{
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						Template: template.GetId(),
+						NetworkAttachments: []*privatev1.NetworkAttachment{
+							privatev1.NetworkAttachment_builder{Subnet: s1.GetId()}.Build(),
+							privatev1.NetworkAttachment_builder{Subnet: s2.GetId()}.Build(),
+						},
+					}.Build(),
+				}.Build()
+
+				request := &privatev1.ComputeInstancesCreateRequest{}
+				request.SetObject(vm)
+
+				response, err := server.Create(ctx, request)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response).ToNot(BeNil())
+				Expect(response.GetObject().GetSpec().GetNetworkAttachments()).To(HaveLen(2))
+				Expect(response.GetObject().GetSpec().GetNetworkAttachments()[0].GetSubnet()).To(Equal(s1.GetId()))
+				Expect(response.GetObject().GetSpec().GetNetworkAttachments()[1].GetSubnet()).To(Equal(s2.GetId()))
+			})
+		})
+
 		Context("Optional network fields", func() {
 			It("Should succeed with no network references", func() {
 				vm := privatev1.ComputeInstance_builder{

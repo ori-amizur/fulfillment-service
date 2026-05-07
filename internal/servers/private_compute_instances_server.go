@@ -31,6 +31,7 @@ import (
 
 	privatev1 "github.com/osac-project/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/fulfillment-service/internal/auth"
+	"github.com/osac-project/fulfillment-service/internal/computeinstancespec"
 	"github.com/osac-project/fulfillment-service/internal/database"
 	"github.com/osac-project/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/fulfillment-service/internal/utils"
@@ -192,8 +193,11 @@ func (s *PrivateComputeInstancesServer) Update(ctx context.Context,
 	request *privatev1.ComputeInstancesUpdateRequest) (response *privatev1.ComputeInstancesUpdateResponse, err error) {
 	// Only validate fields affected by the update mask. With a field mask the object
 	// is sparse so validating fields absent from it would fail incorrectly.
+	// Skip validation entirely if the ComputeInstance is being deleted, as referenced
+	// resources (subnets, security groups) may already be deleted.
 	mask := request.GetUpdateMask()
-	if hasMaskPrefix(mask, "spec.subnet", "spec.security_groups") {
+	isBeingDeleted := request.GetObject().GetMetadata().GetDeletionTimestamp() != nil
+	if !isBeingDeleted && hasMaskPrefix(mask, "spec.subnet", "spec.security_groups", "spec.network_attachments") {
 		err = s.validateNetworkReferences(ctx, request.GetObject())
 		if err != nil {
 			return
@@ -372,7 +376,7 @@ func hasMaskPrefix(mask *fieldmaskpb.FieldMask, prefixes ...string) bool {
 }
 
 // validateNetworkReferences validates that referenced Subnet and SecurityGroups exist, are in READY state,
-// belong to the same tenant, and SecurityGroups belong to the same VirtualNetwork as the Subnet.
+// belong to the same tenant, and SecurityGroups belong to the same VirtualNetwork as their attachment's Subnet.
 //
 // Implements requirements VAL-01, VAL-02, VAL-03, VAL-04.
 func (s *PrivateComputeInstancesServer) validateNetworkReferences(ctx context.Context, vm *privatev1.ComputeInstance) error {
@@ -385,98 +389,103 @@ func (s *PrivateComputeInstancesServer) validateNetworkReferences(ctx context.Co
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance spec is mandatory")
 	}
 
-	subnetID := spec.GetSubnet()
-	securityGroupIDs := spec.GetSecurityGroups()
-
-	// If no network references, nothing to validate
-	if subnetID == "" && len(securityGroupIDs) == 0 {
+	attachments, err := computeinstancespec.EffectiveNetworkAttachments(spec)
+	if err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", err.Error())
+	}
+	if len(attachments) == 0 {
 		return nil
 	}
 
-	var subnet *privatev1.Subnet
-	var virtualNetworkID string
-
-	// VAL-01: Validate Subnet exists and is READY
-	if subnetID != "" {
-		getSubnetResponse, err := s.subnetsDao.Get().
-			SetId(subnetID).
-			Do(ctx)
-		if err != nil {
-			var notFoundErr *dao.ErrNotFound
-			if errors.As(err, &notFoundErr) {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"subnet '%s' does not exist", subnetID)
-			}
-			s.logger.ErrorContext(ctx, "Failed to query Subnet",
-				slog.String("subnet_id", subnetID),
-				slog.Any("error", err))
-			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate subnet")
-		}
-
-		subnet = getSubnetResponse.GetObject()
-		if subnet == nil {
+	for i, att := range attachments {
+		subnetID := att.GetSubnet()
+		securityGroupIDs := att.GetSecurityGroups()
+		if subnetID == "" && len(securityGroupIDs) > 0 {
 			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"subnet '%s' does not exist", subnetID)
+				"network_attachments[%d]: subnet is required when security_groups are set", i)
+		}
+		if subnetID == "" {
+			continue
 		}
 
-		// VAL-01: Check Subnet is READY
-		if subnet.GetStatus().GetState() != privatev1.SubnetState_SUBNET_STATE_READY {
-			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-				"subnet '%s' is not in READY state (current state: %s)",
-				subnetID, subnet.GetStatus().GetState().String())
-		}
+		var subnet *privatev1.Subnet
+		var virtualNetworkID string
 
-		// Store VirtualNetwork ID for SecurityGroup validation
-		virtualNetworkID = subnet.GetSpec().GetVirtualNetwork()
-	}
-
-	// VAL-02, VAL-03: Validate SecurityGroups exist, are READY, and belong to same VirtualNetwork
-	for _, sgID := range securityGroupIDs {
-		if sgID == "" {
-			continue // Skip empty strings
-		}
-
-		getSGResponse, err := s.securityGroupsDao.Get().
-			SetId(sgID).
-			Do(ctx)
-		if err != nil {
-			var notFoundErr *dao.ErrNotFound
-			if errors.As(err, &notFoundErr) {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"security group '%s' does not exist", sgID)
+		// VAL-01: Validate Subnet exists and is READY
+		if subnetID != "" {
+			getSubnetResponse, getErr := s.subnetsDao.Get().
+				SetId(subnetID).
+				Do(ctx)
+			if getErr != nil {
+				var notFoundErr *dao.ErrNotFound
+				if errors.As(getErr, &notFoundErr) {
+					return grpcstatus.Errorf(grpccodes.InvalidArgument,
+						"network_attachments[%d]: subnet '%s' does not exist", i, subnetID)
+				}
+				s.logger.ErrorContext(ctx, "Failed to query Subnet",
+					slog.String("subnet_id", subnetID),
+					slog.Any("error", getErr))
+				return grpcstatus.Errorf(grpccodes.Internal, "failed to validate subnet")
 			}
-			s.logger.ErrorContext(ctx, "Failed to query SecurityGroup",
-				slog.String("security_group_id", sgID),
-				slog.Any("error", err))
-			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate security group")
-		}
 
-		sg := getSGResponse.GetObject()
-		if sg == nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"security group '%s' does not exist", sgID)
-		}
-
-		// VAL-02: Check SecurityGroup is READY
-		if sg.GetStatus().GetState() != privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY {
-			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-				"security group '%s' is not in READY state (current state: %s)",
-				sgID, sg.GetStatus().GetState().String())
-		}
-
-		// VAL-03: If Subnet was provided, verify SecurityGroup belongs to same VirtualNetwork
-		if virtualNetworkID != "" {
-			sgVirtualNetworkID := sg.GetSpec().GetVirtualNetwork()
-			if sgVirtualNetworkID != virtualNetworkID {
+			subnet = getSubnetResponse.GetObject()
+			if subnet == nil {
 				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"security group '%s' belongs to VirtualNetwork '%s', but subnet '%s' belongs to VirtualNetwork '%s'",
-					sgID, sgVirtualNetworkID, subnetID, virtualNetworkID)
+					"network_attachments[%d]: subnet '%s' does not exist", i, subnetID)
+			}
+
+			if subnet.GetStatus().GetState() != privatev1.SubnetState_SUBNET_STATE_READY {
+				return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+					"network_attachments[%d]: subnet '%s' is not in READY state (current state: %s)",
+					i, subnetID, subnet.GetStatus().GetState().String())
+			}
+
+			virtualNetworkID = subnet.GetSpec().GetVirtualNetwork()
+		}
+
+		for _, sgID := range securityGroupIDs {
+			if sgID == "" {
+				continue
+			}
+
+			getSGResponse, getErr := s.securityGroupsDao.Get().
+				SetId(sgID).
+				Do(ctx)
+			if getErr != nil {
+				var notFoundErr *dao.ErrNotFound
+				if errors.As(getErr, &notFoundErr) {
+					return grpcstatus.Errorf(grpccodes.InvalidArgument,
+						"network_attachments[%d]: security group '%s' does not exist", i, sgID)
+				}
+				s.logger.ErrorContext(ctx, "Failed to query SecurityGroup",
+					slog.String("security_group_id", sgID),
+					slog.Any("error", getErr))
+				return grpcstatus.Errorf(grpccodes.Internal, "failed to validate security group")
+			}
+
+			sg := getSGResponse.GetObject()
+			if sg == nil {
+				return grpcstatus.Errorf(grpccodes.InvalidArgument,
+					"network_attachments[%d]: security group '%s' does not exist", i, sgID)
+			}
+
+			if sg.GetStatus().GetState() != privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY {
+				return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+					"network_attachments[%d]: security group '%s' is not in READY state (current state: %s)",
+					i, sgID, sg.GetStatus().GetState().String())
+			}
+
+			if virtualNetworkID != "" {
+				sgVirtualNetworkID := sg.GetSpec().GetVirtualNetwork()
+				if sgVirtualNetworkID != virtualNetworkID {
+					return grpcstatus.Errorf(grpccodes.InvalidArgument,
+						"network_attachments[%d]: security group '%s' belongs to VirtualNetwork '%s', but subnet '%s' belongs to VirtualNetwork '%s'",
+						i, sgID, sgVirtualNetworkID, subnetID, virtualNetworkID)
+				}
 			}
 		}
 	}
 
 	// VAL-04: Tenant isolation is enforced by TenancyLogic in GenericDAO.Get()
-	// All DAO lookups above are automatically scoped to the requesting tenant
-
 	return nil
 }
